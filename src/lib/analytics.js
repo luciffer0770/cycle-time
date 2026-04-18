@@ -19,6 +19,24 @@ export function bottleneckContributions(schedule) {
     .sort((a, b) => b.pct - a.pct);
 }
 
+// Pareto: ranks ALL steps by cycle time and shows cumulative %.
+export function pareto(steps) {
+  const arr = [...steps]
+    .map((s) => ({ id: s.id, name: s.name, value: computeCycleTime(s) }))
+    .filter((x) => x.value > 0)
+    .sort((a, b) => b.value - a.value);
+  const total = arr.reduce((a, b) => a + b.value, 0);
+  let cum = 0;
+  return arr.map((x) => {
+    cum += x.value;
+    return {
+      ...x,
+      pct: total ? (x.value / total) * 100 : 0,
+      cumulativePct: total ? (cum / total) * 100 : 0,
+    };
+  });
+}
+
 export function vaVsNva(steps) {
   let va = 0;
   let nva = 0;
@@ -49,15 +67,25 @@ export function taktGap(schedule, taktTime) {
   };
 }
 
-// Predict impact of reducing a single step by `delta` seconds.
-// Returns a full delta snapshot using the engine for correctness.
+// Throughput at a given takt time / total cycle (whichever binds).
+export function throughput(schedule, taktTime, hoursPerDay = 8, shiftsPerDay = 1) {
+  const binding = Math.max(schedule.totalCycleTime || 0, Number(taktTime) || 0);
+  if (!binding) return { perHour: 0, perShift: 0, perDay: 0, bindingSeconds: 0 };
+  const perHour = 3600 / binding;
+  const perShift = perHour * hoursPerDay;
+  const perDay = perShift * shiftsPerDay;
+  return {
+    perHour,
+    perShift,
+    perDay,
+    bindingSeconds: binding,
+  };
+}
+
 export function stepImpact(steps, stepId, delta = 1) {
   const patched = steps.map((s) =>
     s.id === stepId
-      ? {
-          ...s,
-          machineTime: Math.max(0, Number(s.machineTime || 0) - delta),
-        }
+      ? { ...s, machineTime: Math.max(0, Number(s.machineTime || 0) - delta) }
       : s,
   );
   const before = computeSchedule(steps);
@@ -69,8 +97,6 @@ export function stepImpact(steps, stepId, delta = 1) {
   };
 }
 
-// Aggregated per-step impact sensitivity: if each step reduced by 1s, how much
-// would the total cycle time drop? Useful ranking for AI suggestions.
 export function allStepImpacts(steps) {
   const baseline = computeSchedule(steps).totalCycleTime;
   return steps
@@ -90,17 +116,28 @@ export function allStepImpacts(steps) {
     .sort((a, b) => b.savedPerSecond - a.savedPerSecond);
 }
 
-// Load per station from a completed schedule (station balancing).
+// Load per station (for Yamazumi + balancing)
 export function lineBalancing(schedule) {
   const stations = new Map();
   schedule.steps.forEach((s) => {
     const key = s.stationId || 'unassigned';
-    if (!stations.has(key)) stations.set(key, { stationId: key, load: 0, steps: [] });
+    if (!stations.has(key))
+      stations.set(key, {
+        stationId: key,
+        load: 0,
+        steps: [],
+        va: 0,
+        nva: 0,
+      });
     const st = stations.get(key);
     st.load += s.cycleTime;
-    st.steps.push(s.id);
+    if (s.isValueAdded) st.va += s.cycleTime;
+    else st.nva += s.cycleTime;
+    st.steps.push(s);
   });
-  const loads = Array.from(stations.values());
+  const loads = Array.from(stations.values()).sort((a, b) =>
+    String(a.stationId).localeCompare(String(b.stationId)),
+  );
   const maxLoad = loads.reduce((m, x) => Math.max(m, x.load), 0);
   const sumLoad = loads.reduce((m, x) => m + x.load, 0);
   const avgLoad = loads.length ? sumLoad / loads.length : 0;
@@ -108,7 +145,33 @@ export function lineBalancing(schedule) {
   return { stations: loads, maxLoad, avgLoad, balance };
 }
 
-// Auto line balancer: greedy Longest Processing Time (LPT) across N stations.
+// Yamazumi chart data: one row per station, segments per step with cumulative
+// time from bottom. Color by VA/NVA and highlight machine vs operator.
+export function yamazumi(schedule) {
+  const bal = lineBalancing(schedule);
+  return bal.stations.map((st) => {
+    let acc = 0;
+    return {
+      stationId: st.stationId,
+      total: st.load,
+      segments: st.steps.map((s) => {
+        const seg = {
+          stepId: s.id,
+          name: s.name,
+          start: acc,
+          duration: s.cycleTime,
+          end: acc + s.cycleTime,
+          isValueAdded: s.isValueAdded,
+          isCritical: s.isCritical,
+        };
+        acc += s.cycleTime;
+        return seg;
+      }),
+    };
+  });
+}
+
+// Greedy LPT auto balancer
 export function autoBalance(steps, stationCount = 4) {
   const N = Math.max(1, stationCount | 0);
   const stations = Array.from({ length: N }, (_, i) => ({
@@ -125,11 +188,13 @@ export function autoBalance(steps, stationCount = 4) {
   stations.sort((a, b) => a.stationId.localeCompare(b.stationId));
   const assignments = new Map();
   stations.forEach((st) => st.steps.forEach((id) => assignments.set(id, st.stationId)));
-  const patched = steps.map((s) => ({ ...s, stationId: assignments.get(s.id) || s.stationId }));
+  const patched = steps.map((s) => ({
+    ...s,
+    stationId: assignments.get(s.id) || s.stationId,
+  }));
   return { stations, patched };
 }
 
-// Variability across steps.
 export function variability(steps) {
   const values = steps.map((s) => computeCycleTime(s));
   if (!values.length) return { min: 0, max: 0, avg: 0, std: 0 };
@@ -140,7 +205,6 @@ export function variability(steps) {
   return { min, max, avg, std };
 }
 
-// Distribution buckets for a histogram view.
 export function distribution(steps, buckets = 8) {
   const values = steps.map((s) => computeCycleTime(s));
   if (!values.length) return [];
@@ -162,6 +226,31 @@ export function distribution(steps, buckets = 8) {
 }
 
 // -----------------------------------------------------------------------------
+// MUDA (7 wastes) classification tally
+// -----------------------------------------------------------------------------
+export const MUDA_TYPES = [
+  { id: 'waiting', label: 'Waiting' },
+  { id: 'transport', label: 'Transport' },
+  { id: 'motion', label: 'Motion' },
+  { id: 'over-processing', label: 'Over-processing' },
+  { id: 'inventory', label: 'Inventory' },
+  { id: 'over-production', label: 'Over-production' },
+  { id: 'defects', label: 'Defects' },
+];
+
+export function mudaSummary(steps) {
+  const map = new Map(MUDA_TYPES.map((m) => [m.id, { ...m, seconds: 0, count: 0 }]));
+  steps.forEach((s) => {
+    if (!s.isValueAdded && s.mudaType && map.has(s.mudaType)) {
+      const m = map.get(s.mudaType);
+      m.seconds += computeCycleTime(s);
+      m.count += 1;
+    }
+  });
+  return Array.from(map.values());
+}
+
+// -----------------------------------------------------------------------------
 // Smart suggestions & AI-style optimization
 // -----------------------------------------------------------------------------
 
@@ -174,7 +263,7 @@ export function suggestNextSteps(step) {
       id: 'cooling',
       name: 'Cooling / Dwell',
       reason: 'High machine time — add a cooling dwell to stabilize cycle.',
-      template: { machineTime: 4, operatorTime: 0, setupTime: 0, isValueAdded: false },
+      template: { machineTime: 4, operatorTime: 0, setupTime: 0, isValueAdded: false, mudaType: 'waiting' },
     });
   }
   if (ot >= 15) {
@@ -189,19 +278,19 @@ export function suggestNextSteps(step) {
     id: 'inspection',
     name: 'Inspection',
     reason: 'Quality gate after critical operation.',
-    template: { machineTime: 0, operatorTime: 5, setupTime: 0, isValueAdded: false },
+    template: { machineTime: 0, operatorTime: 5, setupTime: 0, isValueAdded: false, mudaType: 'over-processing' },
   });
   suggestions.push({
     id: 'transfer',
     name: 'Transfer',
     reason: 'Move part to next station.',
-    template: { machineTime: 0, operatorTime: 3, setupTime: 0, transferTime: 3, isValueAdded: false },
+    template: { machineTime: 0, operatorTime: 3, setupTime: 0, transferTime: 3, isValueAdded: false, mudaType: 'transport' },
   });
   suggestions.push({
     id: 'quality',
     name: 'Quality Check (SPC)',
     reason: 'Statistical process control checkpoint.',
-    template: { machineTime: 0, operatorTime: 4, setupTime: 0, isValueAdded: false },
+    template: { machineTime: 0, operatorTime: 4, setupTime: 0, isValueAdded: false, mudaType: 'defects' },
   });
   return suggestions;
 }
@@ -237,7 +326,6 @@ export function suggestOptimization(steps) {
 // -----------------------------------------------------------------------------
 // Validation
 // -----------------------------------------------------------------------------
-
 export function validateSteps(steps) {
   const issues = [];
   const byId = new Map(steps.map((s) => [s.id, s]));
@@ -285,7 +373,6 @@ export function validateSteps(steps) {
     });
   });
 
-  // Cycle detection on DAG
   const schedule = computeSchedule(steps);
   if (schedule.cycleDetected) {
     issues.push({
@@ -297,7 +384,6 @@ export function validateSteps(steps) {
   return issues;
 }
 
-// What-if: remove a step, return new schedule.
 export function simulateRemoveStep(steps, stepId) {
   const remaining = steps
     .filter((s) => s.id !== stepId)
@@ -308,6 +394,36 @@ export function simulateRemoveStep(steps, stepId) {
   const before = computeSchedule(steps);
   const after = computeSchedule(remaining);
   return { before, after, delta: before.totalCycleTime - after.totalCycleTime, remaining };
+}
+
+// Diff between two step sets (used in version compare)
+export function diffSteps(a, b) {
+  const byIdA = new Map((a || []).map((s) => [s.id, s]));
+  const byIdB = new Map((b || []).map((s) => [s.id, s]));
+  const added = [];
+  const removed = [];
+  const changed = [];
+  byIdB.forEach((s, id) => {
+    if (!byIdA.has(id)) added.push(s);
+    else {
+      const o = byIdA.get(id);
+      const fields = [];
+      ['name', 'machineTime', 'operatorTime', 'setupTime', 'groupId', 'stationId', 'isValueAdded'].forEach(
+        (f) => {
+          if (o[f] !== s[f]) fields.push({ field: f, from: o[f], to: s[f] });
+        },
+      );
+      const depsA = (o.dependencies || []).slice().sort().join(',');
+      const depsB = (s.dependencies || []).slice().sort().join(',');
+      if (depsA !== depsB)
+        fields.push({ field: 'dependencies', from: o.dependencies, to: s.dependencies });
+      if (fields.length) changed.push({ id, name: s.name, fields });
+    }
+  });
+  byIdA.forEach((s, id) => {
+    if (!byIdB.has(id)) removed.push(s);
+  });
+  return { added, removed, changed };
 }
 
 export { computeCycleTime, computeSchedule, valueAddedTime };

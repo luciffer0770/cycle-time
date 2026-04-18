@@ -1,6 +1,7 @@
 import React from 'react';
 import Sidebar from './Sidebar.jsx';
 import TopBar from './TopBar.jsx';
+import StatusBar from './StatusBar.jsx';
 import Toast from '../ui/Toast.jsx';
 
 export default function AppShell({ children }) {
@@ -11,15 +12,8 @@ export default function AppShell({ children }) {
         <Sidebar />
         <div className="flex-1 flex flex-col min-w-0">
           <TopBar />
-          <main className="flex-1 p-6 overflow-x-hidden">{children}</main>
-          <footer className="px-6 py-3 text-[11px] text-slate-500 flex items-center justify-between border-t border-white/5">
-            <span className="font-mono">
-              CTA v1.0 · Industrial Engineering Console · local-only
-            </span>
-            <span className="font-mono">
-              {new Date().toLocaleString()}
-            </span>
-          </footer>
+          <main className="flex-1 p-5 overflow-x-hidden overflow-y-auto">{children}</main>
+          <StatusBar />
         </div>
       </div>
       <Toast />

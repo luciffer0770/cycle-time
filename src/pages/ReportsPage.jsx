@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useRef } from 'react';
 import Panel from '../components/ui/Panel.jsx';
 import { useStore } from '../store/useStore.js';
 import { computeSchedule, efficiency, oee } from '../lib/engine.js';
@@ -8,26 +8,39 @@ import {
   taktGap,
   variability,
   suggestOptimization,
+  diffSteps,
 } from '../lib/analytics.js';
-import { fmtPct, fmtSec } from '../lib/utils.js';
+import { fmtPct, fmtSec, classNames } from '../lib/utils.js';
 import { exportStepsToXlsx } from '../lib/excel.js';
 import { exportReportPdf } from '../lib/pdf.js';
+import {
+  downloadProjectJson,
+  readProjectJsonFile,
+  downloadFullBackup,
+  restoreFullBackup,
+} from '../lib/project-io.js';
 import {
   IconDownload,
   IconSave,
   IconRefresh,
   IconTrash,
+  IconUpload,
+  IconHistory,
 } from '../components/ui/Icons.jsx';
 
 export default function ReportsPage() {
-  const project = useStore((s) => s.project);
+  const project = useStore((s) => s.getActiveProject());
   const settings = useStore((s) => s.settings);
-  const versions = useStore((s) => s.versions);
+  const versions = useStore((s) => s.getVersions());
   const saveVersion = useStore((s) => s.saveVersion);
   const restoreVersion = useStore((s) => s.restoreVersion);
+  const renameVersion = useStore((s) => s.renameVersion);
   const deleteVersion = useStore((s) => s.deleteVersion);
   const notify = useStore((s) => s.notify);
   const [label, setLabel] = useState('');
+  const [diffAgainst, setDiffAgainst] = useState(null);
+  const jsonRef = useRef(null);
+  const backupRef = useRef(null);
 
   const schedule = useMemo(() => computeSchedule(project.steps), [project.steps]);
   const eff = efficiency(schedule);
@@ -37,6 +50,42 @@ export default function ReportsPage() {
   const contrib = bottleneckContributions(schedule);
   const opt = suggestOptimization(project.steps);
   const o = oee(settings.oee);
+
+  const diff = useMemo(() => {
+    if (!diffAgainst) return null;
+    const v = versions.find((x) => x.id === diffAgainst);
+    if (!v) return null;
+    return { version: v, ...diffSteps(v.snapshot.steps || [], project.steps) };
+  }, [diffAgainst, versions, project.steps]);
+
+  const handleJsonImport = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const p = await readProjectJsonFile(file);
+      const st = useStore.getState();
+      st.createProject('cnc-machining', p.name);
+      st.patchActiveProject(() => ({ ...p }));
+      notify(`Imported project “${p.name}”`, 'success');
+    } catch (err) {
+      notify('Failed: ' + err.message, 'error');
+    } finally {
+      e.target.value = '';
+    }
+  };
+  const handleBackupRestore = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      await restoreFullBackup(file);
+      notify('Backup restored. Reloading…', 'success');
+      setTimeout(() => location.reload(), 500);
+    } catch (err) {
+      notify('Restore failed: ' + err.message, 'error');
+    } finally {
+      e.target.value = '';
+    }
+  };
 
   return (
     <div className="space-y-4">
@@ -48,6 +97,26 @@ export default function ReportsPage() {
           tone="cyan"
           right={
             <div className="flex items-center gap-2">
+              <input
+                type="file"
+                accept="application/json"
+                ref={jsonRef}
+                onChange={handleJsonImport}
+                className="hidden"
+              />
+              <input
+                type="file"
+                accept="application/json"
+                ref={backupRef}
+                onChange={handleBackupRestore}
+                className="hidden"
+              />
+              <button className="btn-ghost" onClick={() => jsonRef.current?.click()}>
+                <IconUpload className="w-3.5 h-3.5" /> Import JSON
+              </button>
+              <button className="btn-ghost" onClick={() => downloadProjectJson(project)}>
+                <IconDownload className="w-3.5 h-3.5" /> JSON
+              </button>
               <button
                 className="btn-ghost"
                 onClick={() => {
@@ -69,14 +138,11 @@ export default function ReportsPage() {
             </div>
           }
         >
-          {/* Dark preview of report content */}
           <div className="rounded-lg border border-white/10 bg-black/30 p-5 space-y-4">
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-[10px] uppercase tracking-[0.3em] text-cyan">Engineering Report</div>
-                <h3 className="text-xl font-semibold mt-1 text-gradient-cool">
-                  {project.name}
-                </h3>
+                <h3 className="text-xl font-semibold mt-1 text-gradient-cool">{project.name}</h3>
                 <div className="text-[11px] text-slate-500 font-mono mt-1">
                   Takt: {project.taktTime}s · {project.steps.length} steps
                 </div>
@@ -104,7 +170,7 @@ export default function ReportsPage() {
                 Critical Path Contribution
               </div>
               <div className="space-y-1.5">
-                {contrib.slice(0, 6).map((c) => {
+                {contrib.slice(0, 8).map((c) => {
                   const names = c.stepIds
                     .map((sid) => schedule.steps.find((x) => x.id === sid)?.name)
                     .filter(Boolean)
@@ -132,11 +198,11 @@ export default function ReportsPage() {
 
             <div>
               <div className="text-[10px] uppercase tracking-widest text-slate-400 mb-2">
-                Schedule (first 10)
+                Schedule
               </div>
-              <div className="overflow-auto rounded-md border border-white/5">
+              <div className="overflow-auto rounded-md border border-white/5 max-h-64">
                 <table className="w-full text-[11px]">
-                  <thead className="bg-black/40 text-slate-500 text-[10px] uppercase tracking-widest">
+                  <thead className="bg-black/40 text-slate-500 text-[10px] uppercase tracking-widest sticky top-0">
                     <tr>
                       <th className="text-left px-2 py-1.5">Step</th>
                       <th className="text-right px-2 py-1.5">M</th>
@@ -149,7 +215,7 @@ export default function ReportsPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {schedule.steps.slice(0, 10).map((s) => (
+                    {schedule.steps.map((s) => (
                       <tr key={s.id} className="border-t border-white/5">
                         <td className="px-2 py-1 truncate text-slate-200">
                           {s.isCritical && <span className="text-critical mr-1">●</span>}
@@ -199,16 +265,35 @@ export default function ReportsPage() {
             <div className="grid grid-cols-3 gap-3 text-[11px] font-mono">
               <Mini label="VA" value={fmtPct(va.vaPct)} tone="green" />
               <Mini label="NVA" value={fmtPct(va.nvaPct)} tone="red" />
-              <Mini
-                label="σ Step Time"
-                value={`${vari.std.toFixed(2)}s`}
-                tone="violet"
-              />
+              <Mini label="σ Step Time" value={`${vari.std.toFixed(2)}s`} tone="violet" />
             </div>
+          </div>
+
+          <div className="mt-3 flex items-center justify-between">
+            <button
+              className="btn-ghost text-xs"
+              onClick={() => downloadFullBackup()}
+              title="Download a complete backup of projects, versions, and settings"
+            >
+              <IconDownload className="w-3.5 h-3.5" /> Full Backup
+            </button>
+            <button
+              className="btn-ghost text-xs"
+              onClick={() => backupRef.current?.click()}
+              title="Restore from a full backup JSON"
+            >
+              <IconUpload className="w-3.5 h-3.5" /> Restore Backup
+            </button>
           </div>
         </Panel>
 
-        <Panel className="col-span-4" title="Version Control" tone="violet">
+        <Panel className="col-span-4" title="Version Control" tone="violet"
+          right={
+            <span className="chip border border-violet/40 bg-violet/10 text-violet">
+              <IconHistory className="w-3 h-3" /> {versions.length}
+            </span>
+          }
+        >
           <div className="flex items-center gap-2">
             <input
               value={label}
@@ -228,51 +313,105 @@ export default function ReportsPage() {
             </button>
           </div>
 
-          <div className="mt-3 max-h-[460px] overflow-auto space-y-2">
+          <div className="mt-3 max-h-[420px] overflow-auto space-y-2">
             {versions.length === 0 && (
-              <div className="py-8 text-center text-sm text-slate-500">
-                No versions saved yet.
-              </div>
+              <div className="py-8 text-center text-sm text-slate-500">No versions yet.</div>
             )}
             {versions.map((v) => (
               <div
                 key={v.id}
-                className="rounded-md border border-white/10 bg-black/30 p-2.5"
+                className={classNames(
+                  'rounded-md border p-2.5 transition',
+                  diffAgainst === v.id
+                    ? 'border-cyan/50 bg-cyan/10 shadow-neon-cyan'
+                    : 'border-white/10 bg-black/30 hover:border-violet/40',
+                )}
               >
-                <div className="flex items-center justify-between">
-                  <div className="text-sm text-slate-100 truncate">{v.label}</div>
-                  <div className="flex items-center gap-1">
-                    <button
-                      className="h-7 w-7 grid place-items-center rounded text-slate-400 hover:text-cyan hover:bg-cyan/10"
-                      title="Restore"
-                      onClick={() => {
-                        restoreVersion(v.id);
-                        notify(`Restored ${v.label}`, 'success');
-                      }}
-                    >
-                      <IconRefresh className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                      className="h-7 w-7 grid place-items-center rounded text-slate-400 hover:text-critical hover:bg-critical/10"
-                      title="Delete"
-                      onClick={() => deleteVersion(v.id)}
-                    >
-                      <IconTrash className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
+                <div className="flex items-center justify-between gap-1">
+                  <input
+                    value={v.label}
+                    onChange={(e) => renameVersion(v.id, e.target.value)}
+                    className="bg-transparent outline-none text-sm text-slate-100 flex-1 focus:text-cyan truncate"
+                  />
+                  <button
+                    className="h-7 w-7 grid place-items-center rounded text-slate-400 hover:text-cyan hover:bg-cyan/10"
+                    title="Compare with current"
+                    onClick={() => setDiffAgainst(diffAgainst === v.id ? null : v.id)}
+                  >
+                    <IconHistory className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    className="h-7 w-7 grid place-items-center rounded text-slate-400 hover:text-optimal hover:bg-optimal/10"
+                    title="Restore"
+                    onClick={() => {
+                      restoreVersion(v.id);
+                      notify(`Restored ${v.label}`, 'success');
+                    }}
+                  >
+                    <IconRefresh className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    className="h-7 w-7 grid place-items-center rounded text-slate-400 hover:text-critical hover:bg-critical/10"
+                    title="Delete"
+                    onClick={() => deleteVersion(v.id)}
+                  >
+                    <IconTrash className="w-3.5 h-3.5" />
+                  </button>
                 </div>
                 <div className="text-[11px] text-slate-500 font-mono mt-1">
                   {new Date(v.createdAt).toLocaleString()} ·{' '}
-                  {v.snapshot?.steps?.length || 0} steps ·{' '}
-                  {v.snapshot?.taktTime || 0}s takt
+                  {v.snapshot?.steps?.length || 0} steps · {v.snapshot?.taktTime || 0}s takt
                 </div>
               </div>
             ))}
           </div>
+
+          {diff && (
+            <div className="mt-4 rounded-md border border-cyan/30 bg-cyan/5 p-3">
+              <div className="text-[10px] uppercase tracking-widest text-cyan mb-2">
+                Diff · Current vs “{diff.version.label}”
+              </div>
+              <div className="space-y-1.5 text-[12px] max-h-64 overflow-auto">
+                {diff.added.length === 0 && diff.removed.length === 0 && diff.changed.length === 0 && (
+                  <div className="text-slate-400 text-[11px]">No differences.</div>
+                )}
+                {diff.added.map((s) => (
+                  <div key={s.id} className="text-optimal">
+                    + {s.name}
+                  </div>
+                ))}
+                {diff.removed.map((s) => (
+                  <div key={s.id} className="text-critical">
+                    − {s.name}
+                  </div>
+                ))}
+                {diff.changed.map((c) => (
+                  <div key={c.id} className="text-slate-200">
+                    <div className="text-cyan">~ {c.name}</div>
+                    <div className="pl-3 text-[10px] font-mono text-slate-400 space-y-0.5">
+                      {c.fields.map((f, i) => (
+                        <div key={i}>
+                          {f.field}: <span className="text-critical">{fmtVal(f.from)}</span>
+                          <span className="text-slate-500"> → </span>
+                          <span className="text-optimal">{fmtVal(f.to)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </Panel>
       </div>
     </div>
   );
+}
+
+function fmtVal(v) {
+  if (v === null || v === undefined) return '—';
+  if (Array.isArray(v)) return `[${v.length}]`;
+  return String(v);
 }
 
 function Kpi({ label, value, tone }) {

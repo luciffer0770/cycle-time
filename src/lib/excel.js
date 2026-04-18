@@ -68,6 +68,8 @@ export async function importStepsFromFile(file) {
       endTime: 0,
       cycleTime: 0,
       variability: 0,
+      cost: 0,
+      mudaType: null,
     };
   });
 

@@ -8,6 +8,7 @@ import {
   taktGap,
   variability,
   suggestOptimization,
+  throughput,
 } from '../lib/analytics.js';
 import { fmtPct, fmtSec } from '../lib/utils.js';
 import KpiCard from '../components/ui/KpiCard.jsx';
@@ -21,6 +22,7 @@ import {
   IconSparkles,
   IconArrowRight,
   IconLayers,
+  IconBox,
 } from '../components/ui/Icons.jsx';
 import {
   ResponsiveContainer,
@@ -34,7 +36,7 @@ import {
 } from 'recharts';
 
 export default function DashboardPage() {
-  const project = useStore((s) => s.project);
+  const project = useStore((s) => s.getActiveProject());
   const settings = useStore((s) => s.settings);
   const nav = useNavigate();
 
@@ -46,10 +48,11 @@ export default function DashboardPage() {
   const contrib = bottleneckContributions(schedule);
   const optim = suggestOptimization(project.steps);
   const o = oee(settings.oee);
+  const tp = throughput(schedule, project.taktTime, 8, 2);
 
   return (
-    <div className="space-y-6">
-      {/* KPI row */}
+    <div className="space-y-5">
+      {/* KPI row — 4 cards */}
       <div className="grid grid-cols-12 gap-4">
         <div className="col-span-3">
           <KpiCard
@@ -87,14 +90,12 @@ export default function DashboardPage() {
         </div>
         <div className="col-span-3">
           <KpiCard
-            label="OEE"
-            value={fmtPct(o.oee * 100, 1)}
-            sub={`A ${fmtPct(o.availability * 100, 0)} · P ${fmtPct(
-              o.performance * 100,
-              0,
-            )} · Q ${fmtPct(o.quality * 100, 0)}`}
+            label="Throughput"
+            value={`${tp.perHour.toFixed(1)} /h`}
+            sub={`${tp.perShift.toFixed(0)} /shift · ${tp.perDay.toFixed(0)} /day (2 shifts)`}
             tone="violet"
-            Icon={IconTarget}
+            Icon={IconBox}
+            footer={`OEE ${fmtPct(o.oee * 100, 0)} · Takt ${project.taktTime}s`}
           />
         </div>
       </div>
@@ -116,18 +117,14 @@ export default function DashboardPage() {
             </button>
           }
         >
-          <Gantt
-            steps={project.steps.slice(0, 10)}
-            taktTime={project.taktTime}
-            compact
-          />
+          <Gantt steps={project.steps.slice(0, 10)} taktTime={project.taktTime} compact />
         </Panel>
 
         <Panel className="col-span-4" title="Critical Path Contribution" tone="red">
           {contrib.length === 0 ? (
             <EmptyState msg="No critical path yet." />
           ) : (
-            <div className="space-y-3">
+            <div className="space-y-2.5">
               {contrib.slice(0, 6).map((c) => {
                 const names = c.stepIds
                   .map((sid) => schedule.steps.find((x) => x.id === sid)?.name)
@@ -170,10 +167,13 @@ export default function DashboardPage() {
       {/* Secondary row */}
       <div className="grid grid-cols-12 gap-4">
         <Panel className="col-span-4" title="Cycle Time Distribution" tone="cyan">
-          <div className="h-48">
+          <div className="h-52">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart
-                data={project.steps.map((s) => ({ name: s.name, ct: s.machineTime + s.operatorTime + s.setupTime }))}
+                data={project.steps.map((s) => ({
+                  name: s.name,
+                  ct: s.machineTime + s.operatorTime + s.setupTime,
+                }))}
               >
                 <CartesianGrid stroke="rgba(148,163,184,0.1)" vertical={false} />
                 <XAxis dataKey="name" hide />
@@ -242,9 +242,9 @@ export default function DashboardPage() {
               {optim.slice(0, 4).map((o) => (
                 <li
                   key={o.stepId}
-                  className="rounded-md border border-white/10 bg-black/30 px-3 py-2"
+                  className="rounded-md border border-white/10 bg-black/30 px-3 py-2 hover:border-violet/40 transition"
                 >
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2">
                     <span className="text-sm text-slate-100 truncate" title={o.stepName}>
                       {o.stepName}
                     </span>
@@ -263,36 +263,34 @@ export default function DashboardPage() {
       </div>
 
       {/* Quick actions */}
-      <div className="grid grid-cols-12 gap-4">
-        <Panel className="col-span-12" title="Quick Actions" tone="cyan">
-          <div className="flex flex-wrap gap-3">
-            <ActionTile
-              Icon={IconLayers}
-              label="Open Cycle Builder"
-              desc="Create, edit, and link steps"
-              onClick={() => nav('/builder')}
-            />
-            <ActionTile
-              Icon={IconArrowRight}
-              label="Run Simulation"
-              desc="Before / After comparison"
-              onClick={() => nav('/simulation')}
-            />
-            <ActionTile
-              Icon={IconSparkles}
-              label="View Analytics"
-              desc="Line balancing, histograms"
-              onClick={() => nav('/analytics')}
-            />
-            <ActionTile
-              Icon={IconTarget}
-              label="Export Report"
-              desc="PDF & Excel"
-              onClick={() => nav('/reports')}
-            />
-          </div>
-        </Panel>
-      </div>
+      <Panel title="Quick Actions" tone="cyan">
+        <div className="grid grid-cols-4 gap-3">
+          <ActionTile
+            Icon={IconLayers}
+            label="Cycle Builder"
+            desc="Create, edit, link steps"
+            onClick={() => nav('/builder')}
+          />
+          <ActionTile
+            Icon={IconArrowRight}
+            label="Run Simulation"
+            desc="Before/after what-if"
+            onClick={() => nav('/simulation')}
+          />
+          <ActionTile
+            Icon={IconSparkles}
+            label="Analytics"
+            desc="Yamazumi, Pareto, MUDA"
+            onClick={() => nav('/analytics')}
+          />
+          <ActionTile
+            Icon={IconTarget}
+            label="Export Report"
+            desc="PDF · Excel · JSON"
+            onClick={() => nav('/reports')}
+          />
+        </div>
+      </Panel>
     </div>
   );
 }
@@ -342,9 +340,6 @@ function Donut({ va, nva }) {
             <stop offset="0%" stopColor="#E11D2E" />
             <stop offset="100%" stopColor="#6D28D9" />
           </linearGradient>
-          <filter id="soft">
-            <feGaussianBlur stdDeviation="2" />
-          </filter>
         </defs>
         <circle cx="80" cy="80" r={R} fill="none" stroke="url(#nva-grad)" strokeWidth="14" />
         <circle
@@ -379,7 +374,8 @@ function Donut({ va, nva }) {
         <LegendRow color="optimal" label="Value-added" value={`${va.toFixed(1)}s`} />
         <LegendRow color="critical" label="Non-value-added" value={`${nva.toFixed(1)}s`} />
         <div className="text-[11px] text-slate-400 pt-2 border-t border-white/5">
-          Total process content: <span className="font-mono text-slate-200">{(va + nva).toFixed(1)}s</span>
+          Total process content:{' '}
+          <span className="font-mono text-slate-200">{(va + nva).toFixed(1)}s</span>
         </div>
       </div>
     </div>

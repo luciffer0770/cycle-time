@@ -235,6 +235,67 @@ export const IconFlag = (p) => (
   </Base>
 );
 
+export const IconChevronLeft = (p) => (
+  <Base {...p}>
+    <path d="m14 6-6 6 6 6" />
+  </Base>
+);
+
+export const IconChevronRight = (p) => (
+  <Base {...p}>
+    <path d="m10 6 6 6-6 6" />
+  </Base>
+);
+
+export const IconUndo = (p) => (
+  <Base {...p}>
+    <path d="M9 14L4 9l5-5" />
+    <path d="M4 9h9a7 7 0 0 1 0 14h-2" />
+  </Base>
+);
+
+export const IconRedo = (p) => (
+  <Base {...p}>
+    <path d="M15 14l5-5-5-5" />
+    <path d="M20 9h-9a7 7 0 0 0 0 14h2" />
+  </Base>
+);
+
+export const IconHelp = (p) => (
+  <Base {...p}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M9.5 9a2.5 2.5 0 1 1 3.5 2.3c-.8.4-1 1-1 1.7V14" />
+    <circle cx="12" cy="17" r="0.9" fill="currentColor" />
+  </Base>
+);
+
+export const IconKey = (p) => (
+  <Base {...p}>
+    <circle cx="8" cy="12" r="4" />
+    <path d="M12 12h10" />
+    <path d="M18 12v4" />
+    <path d="M22 12v2" />
+  </Base>
+);
+
+export const IconHistory = (p) => (
+  <Base {...p}>
+    <path d="M3 12a9 9 0 1 0 3-6.7" />
+    <path d="M3 3v5h5" />
+    <path d="M12 8v4l3 2" />
+  </Base>
+);
+
+export const IconShare = (p) => (
+  <Base {...p}>
+    <circle cx="6" cy="12" r="3" />
+    <circle cx="18" cy="6" r="3" />
+    <circle cx="18" cy="18" r="3" />
+    <path d="M8.5 10.5l7-3" />
+    <path d="M8.5 13.5l7 3" />
+  </Base>
+);
+
 export const IconBeaker = (p) => (
   <Base {...p}>
     <path d="M9 3h6" />

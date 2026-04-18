@@ -4,9 +4,8 @@ import Gantt from '../components/gantt/Gantt.jsx';
 import { useStore } from '../store/useStore.js';
 import { computeSchedule, efficiency } from '../lib/engine.js';
 import { vaVsNva, simulateRemoveStep } from '../lib/analytics.js';
-import { fmtPct, fmtSec, classNames } from '../lib/utils.js';
+import { fmtPct, classNames } from '../lib/utils.js';
 import {
-  IconPlay,
   IconRefresh,
   IconTrash,
   IconCheck,
@@ -14,7 +13,7 @@ import {
 } from '../components/ui/Icons.jsx';
 
 export default function SimulationPage() {
-  const project = useStore((s) => s.project);
+  const project = useStore((s) => s.getActiveProject());
   const copyToSim = useStore((s) => s.copyToSimulation);
   const updateSim = useStore((s) => s.updateSimStep);
   const setSim = useStore((s) => s.setSimulationSteps);
@@ -22,7 +21,10 @@ export default function SimulationPage() {
   const notify = useStore((s) => s.notify);
 
   const before = useMemo(() => computeSchedule(project.steps), [project.steps]);
-  const after = useMemo(() => computeSchedule(project.simulationSteps), [project.simulationSteps]);
+  const after = useMemo(
+    () => computeSchedule(project.simulationSteps),
+    [project.simulationSteps],
+  );
 
   const beforeVA = vaVsNva(project.steps);
   const afterVA = vaVsNva(project.simulationSteps);
@@ -143,7 +145,7 @@ export default function SimulationPage() {
           <div className="space-y-3 max-h-[520px] overflow-auto pr-2">
             {project.simulationSteps.length === 0 && (
               <div className="py-10 text-center text-slate-500">
-                No simulation steps. Click “Reset from Current” to start.
+                No simulation steps. Click "Reset from Current" to start.
               </div>
             )}
             {project.simulationSteps.map((s) => {

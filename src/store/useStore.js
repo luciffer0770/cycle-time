@@ -1,17 +1,28 @@
 import { create } from 'zustand';
 import { subscribeWithSelector } from 'zustand/middleware';
 import {
-  loadProject,
-  saveProject,
-  loadSettings,
+  loadDb,
+  upsertProject,
+  removeProject as storageRemoveProject,
+  setActiveProject as storageSetActiveProject,
   saveSettings,
+  loadSettings,
   loadVersions,
+  loadVersionMap,
   saveVersion as persistVersion,
-  deleteVersion as removeVersion,
+  deleteVersion as storageDeleteVersion,
+  renameVersion as storageRenameVersion,
+  loadToastHistory,
+  pushToastHistory,
+  clearToastHistory,
 } from '../lib/storage.js';
 import { uid, clone } from '../lib/utils.js';
 import { computeSchedule } from '../lib/engine.js';
-import { makeTemplateSteps } from '../lib/templates.js';
+import { makeTemplateSteps, TEMPLATES } from '../lib/templates.js';
+
+// ---------------------------------------------------------------------------
+// Defaults
+// ---------------------------------------------------------------------------
 
 function newStep(partial = {}) {
   return {
@@ -30,6 +41,8 @@ function newStep(partial = {}) {
     isValueAdded: true,
     stationId: null,
     variability: 0,
+    cost: 0,
+    mudaType: null,
     ...partial,
   };
 }
@@ -39,227 +52,476 @@ const DEFAULT_SETTINGS = {
   defaultTaktTime: 60,
   stationCount: 4,
   currency: 'USD',
+  labourRate: 0,
   showHeatmap: false,
   autoSave: true,
   oee: { availability: 0.9, performance: 0.95, quality: 0.99 },
   precision: 1,
+  sidebarCollapsed: false,
 };
 
-function freshProject() {
-  const { steps, taktTime } = makeTemplateSteps('cnc-machining');
+function freshProject(templateId = 'cnc-machining', name) {
+  const { steps, taktTime } = makeTemplateSteps(templateId);
+  const t = TEMPLATES.find((x) => x.id === templateId);
   return {
     id: uid('proj'),
-    name: 'CNC Machining Cell',
+    name: name || t?.name || 'Untitled Project',
     createdAt: new Date().toISOString(),
     taktTime,
     steps,
     baselineSteps: clone(steps),
     simulationSteps: clone(steps),
     lines: [],
+    notes: '',
   };
 }
 
-const persisted = loadProject();
+// ---------------------------------------------------------------------------
+// Bootstrap: load DB, seed default project if empty
+// ---------------------------------------------------------------------------
+
+function bootstrap() {
+  let db = loadDb();
+  if (!db.projects || Object.keys(db.projects).length === 0) {
+    const p = freshProject();
+    db = upsertProject(p);
+    db = storageSetActiveProject(p.id);
+  }
+  const activeId = db.activeProjectId || Object.keys(db.projects)[0];
+  return { db, activeProjectId: activeId };
+}
+
+const bootstrapped = bootstrap();
 const persistedSettings = loadSettings();
+
+// ---------------------------------------------------------------------------
+// Undo / redo — per-project ring buffer of (steps, taktTime)
+// ---------------------------------------------------------------------------
+
+const UNDO_LIMIT = 80;
+
+function snapshotOf(project) {
+  return {
+    taktTime: project.taktTime,
+    steps: clone(project.steps),
+    name: project.name,
+    notes: project.notes,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
 
 export const useStore = create(
   subscribeWithSelector((set, get) => ({
-    // --- State ---------------------------------------------------------------
-    ready: true,
-    settings: { ...DEFAULT_SETTINGS, ...(persistedSettings || {}) },
-    project: persisted || freshProject(),
-    versions: loadVersions(),
-    toast: null,
+    // DB & active project ---------------------------------------------------
+    db: bootstrapped.db,
+    activeProjectId: bootstrapped.activeProjectId,
 
-    // --- Project-level -------------------------------------------------------
+    settings: { ...DEFAULT_SETTINGS, ...(persistedSettings || {}) },
+
+    // Per-project undo stacks
+    undoStacks: {},
+    redoStacks: {},
+
+    // Ephemeral UI state
+    toast: null,
+    toastHistory: loadToastHistory(),
+    commandPaletteOpen: false,
+    shortcutsOpen: false,
+    onboardingSeen: !!(persistedSettings?.onboardingSeen),
+
+    // Selectors -------------------------------------------------------------
+    getActiveProject() {
+      const { db, activeProjectId } = get();
+      return db.projects[activeProjectId];
+    },
+    getProjects() {
+      return Object.values(get().db.projects).sort(
+        (a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt),
+      );
+    },
+    getVersions() {
+      return loadVersions(get().activeProjectId);
+    },
+    getSchedule() {
+      return computeSchedule(get().getActiveProject()?.steps || []);
+    },
+
+    // Generic undo-aware project mutator
+    patchActiveProject(fn, options = {}) {
+      const { pushUndo = true } = options;
+      const { db, activeProjectId, undoStacks, redoStacks } = get();
+      const prev = db.projects[activeProjectId];
+      if (!prev) return;
+      const next = fn(prev);
+      if (!next || next === prev) return;
+
+      let undo = undoStacks[activeProjectId] || [];
+      let redo = redoStacks[activeProjectId] || [];
+      if (pushUndo) {
+        undo = [...undo, snapshotOf(prev)].slice(-UNDO_LIMIT);
+        redo = [];
+      }
+
+      const updatedDb = {
+        ...db,
+        projects: { ...db.projects, [activeProjectId]: next },
+      };
+      set({
+        db: updatedDb,
+        undoStacks: { ...undoStacks, [activeProjectId]: undo },
+        redoStacks: { ...redoStacks, [activeProjectId]: redo },
+      });
+    },
+
+    undo() {
+      const { db, activeProjectId, undoStacks, redoStacks } = get();
+      const stack = undoStacks[activeProjectId] || [];
+      if (!stack.length) return;
+      const prev = db.projects[activeProjectId];
+      const snap = stack[stack.length - 1];
+      const nextRedo = [...(redoStacks[activeProjectId] || []), snapshotOf(prev)].slice(-UNDO_LIMIT);
+      const nextUndo = stack.slice(0, -1);
+
+      const updated = {
+        ...prev,
+        steps: clone(snap.steps),
+        taktTime: snap.taktTime,
+        name: snap.name,
+        notes: snap.notes,
+      };
+      set({
+        db: { ...db, projects: { ...db.projects, [activeProjectId]: updated } },
+        undoStacks: { ...undoStacks, [activeProjectId]: nextUndo },
+        redoStacks: { ...redoStacks, [activeProjectId]: nextRedo },
+      });
+    },
+
+    redo() {
+      const { db, activeProjectId, undoStacks, redoStacks } = get();
+      const stack = redoStacks[activeProjectId] || [];
+      if (!stack.length) return;
+      const prev = db.projects[activeProjectId];
+      const snap = stack[stack.length - 1];
+      const nextUndo = [...(undoStacks[activeProjectId] || []), snapshotOf(prev)].slice(-UNDO_LIMIT);
+      const nextRedo = stack.slice(0, -1);
+
+      const updated = {
+        ...prev,
+        steps: clone(snap.steps),
+        taktTime: snap.taktTime,
+        name: snap.name,
+        notes: snap.notes,
+      };
+      set({
+        db: { ...db, projects: { ...db.projects, [activeProjectId]: updated } },
+        undoStacks: { ...undoStacks, [activeProjectId]: nextUndo },
+        redoStacks: { ...redoStacks, [activeProjectId]: nextRedo },
+      });
+    },
+
+    canUndo() {
+      return (get().undoStacks[get().activeProjectId] || []).length > 0;
+    },
+    canRedo() {
+      return (get().redoStacks[get().activeProjectId] || []).length > 0;
+    },
+
+    // Project CRUD ----------------------------------------------------------
+    createProject(templateId = 'cnc-machining', name) {
+      const p = freshProject(templateId, name);
+      const db = upsertProject(p);
+      set({ db, activeProjectId: p.id });
+      return p;
+    },
+    duplicateProject(projectId) {
+      const src = get().db.projects[projectId];
+      if (!src) return;
+      const copy = {
+        ...clone(src),
+        id: uid('proj'),
+        name: src.name + ' (copy)',
+        createdAt: new Date().toISOString(),
+      };
+      const db = upsertProject(copy);
+      set({ db, activeProjectId: copy.id });
+      return copy;
+    },
+    renameProject(projectId, name) {
+      get().patchActiveProjectById(projectId, (p) => ({ ...p, name }));
+    },
+    removeProject(projectId) {
+      const db = storageRemoveProject(projectId);
+      const activeProjectId = db.activeProjectId || Object.keys(db.projects)[0];
+      set({ db, activeProjectId });
+    },
+    setActiveProject(projectId) {
+      const db = storageSetActiveProject(projectId);
+      set({ db, activeProjectId: projectId });
+    },
+    patchActiveProjectById(projectId, fn) {
+      const { db } = get();
+      const prev = db.projects[projectId];
+      if (!prev) return;
+      const next = fn(prev);
+      set({ db: { ...db, projects: { ...db.projects, [projectId]: next } } });
+    },
+
     setProjectName(name) {
-      set((s) => ({ project: { ...s.project, name } }));
+      get().patchActiveProject((p) => ({ ...p, name }));
+    },
+    setProjectNotes(notes) {
+      get().patchActiveProject((p) => ({ ...p, notes }));
     },
     setTaktTime(value) {
-      set((s) => ({ project: { ...s.project, taktTime: Number(value) || 0 } }));
+      get().patchActiveProject((p) => ({ ...p, taktTime: Number(value) || 0 }));
     },
 
     resetProject() {
-      set({ project: freshProject() });
+      const fresh = freshProject();
+      get().patchActiveProject((p) => ({ ...fresh, id: p.id, name: p.name }));
     },
 
-    loadTemplate(templateId) {
+    loadTemplateIntoActive(templateId) {
       const { steps, taktTime } = makeTemplateSteps(templateId);
       if (!steps.length) return;
-      set({
-        project: {
-          id: uid('proj'),
-          name: templateId,
-          createdAt: new Date().toISOString(),
-          taktTime,
-          steps,
-          baselineSteps: clone(steps),
-          simulationSteps: clone(steps),
-          lines: [],
-        },
-      });
-    },
-
-    // --- Steps CRUD ----------------------------------------------------------
-    addStep(partial = {}) {
-      const step = newStep(partial);
-      set((s) => ({ project: { ...s.project, steps: [...s.project.steps, step] } }));
-      return step;
-    },
-    updateStep(id, patch) {
-      set((s) => ({
-        project: {
-          ...s.project,
-          steps: s.project.steps.map((x) => (x.id === id ? { ...x, ...patch } : x)),
-        },
+      get().patchActiveProject((p) => ({
+        ...p,
+        taktTime,
+        steps,
+        baselineSteps: clone(steps),
+        simulationSteps: clone(steps),
       }));
     },
+
+    // Steps CRUD ------------------------------------------------------------
+    addStep(partial = {}) {
+      const step = newStep(partial);
+      get().patchActiveProject((p) => ({ ...p, steps: [...p.steps, step] }));
+      return step;
+    },
+    insertStepAfter(refId, partial = {}) {
+      const step = newStep({ ...partial, dependencies: [refId] });
+      get().patchActiveProject((p) => {
+        const idx = p.steps.findIndex((s) => s.id === refId);
+        const next = [...p.steps];
+        if (idx >= 0) next.splice(idx + 1, 0, step);
+        else next.push(step);
+        return { ...p, steps: next };
+      });
+      return step;
+    },
+    updateStep(id, patch, opts = {}) {
+      get().patchActiveProject(
+        (p) => ({
+          ...p,
+          steps: p.steps.map((x) => (x.id === id ? { ...x, ...patch } : x)),
+        }),
+        opts,
+      );
+    },
     removeStep(id) {
-      set((s) => ({
-        project: {
-          ...s.project,
-          steps: s.project.steps
-            .filter((x) => x.id !== id)
-            .map((x) => ({
-              ...x,
-              dependencies: (x.dependencies || []).filter((d) => d !== id),
-            })),
-        },
+      get().patchActiveProject((p) => ({
+        ...p,
+        steps: p.steps
+          .filter((x) => x.id !== id)
+          .map((x) => ({
+            ...x,
+            dependencies: (x.dependencies || []).filter((d) => d !== id),
+          })),
+      }));
+    },
+    removeSteps(ids) {
+      const set = new Set(ids);
+      get().patchActiveProject((p) => ({
+        ...p,
+        steps: p.steps
+          .filter((x) => !set.has(x.id))
+          .map((x) => ({
+            ...x,
+            dependencies: (x.dependencies || []).filter((d) => !set.has(d)),
+          })),
       }));
     },
     duplicateStep(id) {
-      const src = get().project.steps.find((x) => x.id === id);
+      const src = get().getActiveProject().steps.find((x) => x.id === id);
       if (!src) return;
       const copy = newStep({ ...src, id: undefined, name: src.name + ' (copy)' });
-      set((s) => ({ project: { ...s.project, steps: [...s.project.steps, copy] } }));
-    },
-    reorderSteps(nextIds) {
-      const map = new Map(get().project.steps.map((x) => [x.id, x]));
-      const next = nextIds.map((id) => map.get(id)).filter(Boolean);
-      const tail = get().project.steps.filter((x) => !nextIds.includes(x.id));
-      set((s) => ({ project: { ...s.project, steps: [...next, ...tail] } }));
-    },
-    setDependencies(id, deps) {
-      get().updateStep(id, { dependencies: deps });
-    },
-    toggleDependency(id, depId) {
-      const s = get().project.steps.find((x) => x.id === id);
-      if (!s) return;
-      const has = (s.dependencies || []).includes(depId);
-      get().updateStep(id, {
-        dependencies: has
-          ? s.dependencies.filter((d) => d !== depId)
-          : [...(s.dependencies || []), depId],
+      get().patchActiveProject((p) => {
+        const idx = p.steps.findIndex((s) => s.id === id);
+        const next = [...p.steps];
+        next.splice(idx + 1, 0, copy);
+        return { ...p, steps: next };
       });
     },
-    setGroup(id, groupId) {
-      get().updateStep(id, { groupId: groupId || null });
+    reorderSteps(nextIds) {
+      get().patchActiveProject((p) => {
+        const map = new Map(p.steps.map((x) => [x.id, x]));
+        const ordered = nextIds.map((id) => map.get(id)).filter(Boolean);
+        const tail = p.steps.filter((x) => !nextIds.includes(x.id));
+        return { ...p, steps: [...ordered, ...tail] };
+      });
     },
-    setStation(id, stationId) {
-      get().updateStep(id, { stationId: stationId || null });
+    setGroup(ids, groupId) {
+      const set = new Set(Array.isArray(ids) ? ids : [ids]);
+      get().patchActiveProject((p) => ({
+        ...p,
+        steps: p.steps.map((x) => (set.has(x.id) ? { ...x, groupId: groupId || null } : x)),
+      }));
+    },
+    setStation(ids, stationId) {
+      const set = new Set(Array.isArray(ids) ? ids : [ids]);
+      get().patchActiveProject((p) => ({
+        ...p,
+        steps: p.steps.map((x) =>
+          set.has(x.id) ? { ...x, stationId: stationId || null } : x,
+        ),
+      }));
     },
     toggleValueAdded(id) {
-      const s = get().project.steps.find((x) => x.id === id);
+      const s = get().getActiveProject().steps.find((x) => x.id === id);
       if (!s) return;
       get().updateStep(id, { isValueAdded: !s.isValueAdded });
     },
-
-    // Bulk replace (used by Excel import, templates, auto-balance).
     setSteps(steps) {
-      set((s) => ({ project: { ...s.project, steps } }));
+      get().patchActiveProject((p) => ({ ...p, steps }));
     },
 
-    // --- Baseline & Simulation ----------------------------------------------
+    // Baseline / simulation -------------------------------------------------
     captureBaseline() {
-      set((s) => ({ project: { ...s.project, baselineSteps: clone(s.project.steps) } }));
+      get().patchActiveProject((p) => ({ ...p, baselineSteps: clone(p.steps) }), {
+        pushUndo: false,
+      });
     },
     copyToSimulation() {
-      set((s) => ({ project: { ...s.project, simulationSteps: clone(s.project.steps) } }));
+      get().patchActiveProject((p) => ({ ...p, simulationSteps: clone(p.steps) }), {
+        pushUndo: false,
+      });
     },
     updateSimStep(id, patch) {
-      set((s) => ({
-        project: {
-          ...s.project,
-          simulationSteps: s.project.simulationSteps.map((x) =>
+      get().patchActiveProject(
+        (p) => ({
+          ...p,
+          simulationSteps: p.simulationSteps.map((x) =>
             x.id === id ? { ...x, ...patch } : x,
           ),
-        },
-      }));
+        }),
+        { pushUndo: false },
+      );
     },
     setSimulationSteps(steps) {
-      set((s) => ({ project: { ...s.project, simulationSteps: steps } }));
+      get().patchActiveProject((p) => ({ ...p, simulationSteps: steps }), {
+        pushUndo: false,
+      });
     },
     applySimulation() {
-      set((s) => ({ project: { ...s.project, steps: clone(s.project.simulationSteps) } }));
+      get().patchActiveProject((p) => ({ ...p, steps: clone(p.simulationSteps) }));
     },
 
-    // --- Multi-line comparison ----------------------------------------------
+    // Multi-line snapshots --------------------------------------------------
     saveAsLine(label) {
-      const snapshot = clone(get().project.steps);
+      const p = get().getActiveProject();
       const entry = {
         id: uid('line'),
-        label: label || `Line ${get().project.lines.length + 1}`,
+        label: label || `Line ${(p.lines || []).length + 1}`,
         createdAt: new Date().toISOString(),
-        steps: snapshot,
-        taktTime: get().project.taktTime,
+        steps: clone(p.steps),
+        taktTime: p.taktTime,
       };
-      set((s) => ({ project: { ...s.project, lines: [entry, ...s.project.lines] } }));
+      get().patchActiveProject((x) => ({ ...x, lines: [entry, ...(x.lines || [])] }), {
+        pushUndo: false,
+      });
       return entry;
     },
     removeLine(id) {
-      set((s) => ({
-        project: {
-          ...s.project,
-          lines: s.project.lines.filter((l) => l.id !== id),
-        },
-      }));
+      get().patchActiveProject(
+        (p) => ({ ...p, lines: (p.lines || []).filter((l) => l.id !== id) }),
+        { pushUndo: false },
+      );
     },
 
-    // --- Version control ----------------------------------------------------
+    // Versions --------------------------------------------------------------
     saveVersion(label) {
-      const snapshot = clone(get().project);
-      const v = persistVersion(label, snapshot);
-      set({ versions: [v, ...get().versions] });
+      const p = get().getActiveProject();
+      const snap = clone(p);
+      const v = persistVersion(get().activeProjectId, label, snap);
       return v;
     },
-    restoreVersion(id) {
-      const v = get().versions.find((x) => x.id === id);
+    restoreVersion(versionId) {
+      const list = loadVersions(get().activeProjectId);
+      const v = list.find((x) => x.id === versionId);
       if (!v) return;
-      set({ project: clone(v.snapshot) });
+      get().patchActiveProject((_) => clone(v.snapshot));
     },
-    deleteVersion(id) {
-      const next = removeVersion(id);
-      set({ versions: next });
+    renameVersion(versionId, label) {
+      storageRenameVersion(get().activeProjectId, versionId, label);
+      set({}); // force re-render; versions are read from storage each time
+    },
+    deleteVersion(versionId) {
+      storageDeleteVersion(get().activeProjectId, versionId);
+      set({});
     },
 
-    // --- Settings -----------------------------------------------------------
+    // Settings --------------------------------------------------------------
     updateSettings(patch) {
       const next = { ...get().settings, ...patch };
       set({ settings: next });
       saveSettings(next);
     },
-
-    // --- Derived ------------------------------------------------------------
-    getSchedule() {
-      return computeSchedule(get().project.steps);
+    toggleSidebar() {
+      get().updateSettings({ sidebarCollapsed: !get().settings.sidebarCollapsed });
     },
 
-    // --- Toast --------------------------------------------------------------
+    // UI --------------------------------------------------------------------
+    setCommandPaletteOpen(v) {
+      set({ commandPaletteOpen: !!v });
+    },
+    toggleCommandPalette() {
+      set({ commandPaletteOpen: !get().commandPaletteOpen });
+    },
+    setShortcutsOpen(v) {
+      set({ shortcutsOpen: !!v });
+    },
+    markOnboardingSeen() {
+      set({ onboardingSeen: true });
+      get().updateSettings({ onboardingSeen: true });
+    },
+
+    // Toast -----------------------------------------------------------------
     notify(message, tone = 'info') {
-      const id = uid('t');
-      set({ toast: { id, message, tone, at: Date.now() } });
+      const entry = { id: uid('t'), message, tone, at: Date.now() };
+      pushToastHistory({ ...entry, when: new Date().toISOString() });
+      set({
+        toast: entry,
+        toastHistory: [{ ...entry, when: new Date().toISOString() }, ...get().toastHistory].slice(0, 50),
+      });
       setTimeout(() => {
-        if (get().toast && get().toast.id === id) set({ toast: null });
-      }, 3200);
+        if (get().toast && get().toast.id === entry.id) set({ toast: null });
+      }, 3400);
+    },
+    clearToasts() {
+      clearToastHistory();
+      set({ toastHistory: [] });
     },
   })),
 );
 
-// Auto-save on project changes
+// ---------------------------------------------------------------------------
+// Auto-save whenever the DB changes (debounced by Zustand microtask batching)
+// ---------------------------------------------------------------------------
+
 useStore.subscribe(
-  (s) => s.project,
-  (project) => {
-    if (!useStore.getState().settings?.autoSave) return;
-    saveProject(project);
+  (s) => s.db,
+  (db) => {
+    try {
+      const state = useStore.getState();
+      if (!state.settings?.autoSave) return;
+      // Write each project (it's cheap at our scale)
+      Object.values(db.projects).forEach((p) => upsertProject(p));
+    } catch (e) {
+      console.warn('autosave failed', e);
+    }
   },
 );
